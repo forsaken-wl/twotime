@@ -423,7 +423,6 @@ static void build_package(const char *name) {
     /* db */
     snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", db_path);
     run(cmd);
-    char installed_file[MAXPATH];
     snprintf(installed_file, sizeof(installed_file), "%s/installed", db_path);
     FILE *af = fopen(installed_file, "a");
     if (af) { fprintf(af, "%s\n", name); fclose(af); }
