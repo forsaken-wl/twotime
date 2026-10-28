@@ -1,0 +1,429 @@
+#!/bin/sh
+# Azure: package manager for Rinix
+
+set -eu
+
+AZURE_REPO="${AZURE_REPO:-/usr/share/azure/repo}"
+AZURE_DB="${AZURE_DB:-/var/lib/azure}"
+AZURE_CACHE="${AZURE_CACHE:-/var/cache/azure}"
+BASE_PKGS_FILE="${BASE_PKGS_FILE:-/etc/azure/base-packages}"
+
+err() { printf 'azure: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat >&2 <<USAGE
+Usage:
+  azure add <package>
+  azure del <package>
+  azure sync
+  azure upgrade
+  azure upd
+  azure search <term>
+  azure see <path>
+USAGE
+    exit 2
+}
+
+find_repo() {
+    for cand in "$AZURE_REPO" /usr/share/azure/repo /opt/azure/repo /home/ripie/buildroot/pkgrepo /home/ripie/buildroot/pkgrepo/recipes /root/bmcrepo /home/ripie/bmcrepo; do
+        [ -d "$cand" ] || continue
+        if find "$cand" \( -name '*.bbr' -o -name '*.bconf' \) -print -quit 2>/dev/null | grep -q .; then
+            AZURE_REPO="$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_recipe() {
+    local name="$1"
+    for f in "$AZURE_REPO"/*/"$name.bbr" "$AZURE_REPO/$name.bbr" "$AZURE_REPO"/*/"$name.bconf" "$AZURE_REPO/$name.bconf"; do
+        [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+get_field() {
+    local recipe="$1"; local field="$2"
+    sed -n -E "s/^-${field}[: ]+(.*)$/\1/p" "$recipe" 2>/dev/null | head -n 1
+}
+
+is_base() {
+    [ -f "$BASE_PKGS_FILE" ] && grep -Fxq "$1" "$BASE_PKGS_FILE" 2>/dev/null
+}
+
+deps_of() {
+    local recipe="$1"
+    case "$recipe" in
+        *.bconf)
+            sh -c '. "$1"; printf "%s\n" $depends $makedepends' _ "$recipe"
+            ;;
+        *)
+            {
+                get_field "$recipe" depends
+                get_field "$recipe" makedepends
+            } | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true
+            ;;
+    esac
+}
+
+verify_checksum() {
+    local file="$1"; local spec="$2"
+    local algo expected actual
+    algo="${spec%%:*}"
+    expected="${spec#*:}"
+    case "$algo" in
+        sha256) actual=$(sha256sum "$file" | awk '{print $1}') ;;
+        sha512) actual=$(sha512sum "$file" | awk '{print $1}') ;;
+        *) err "unsupported checksum algorithm: $algo" ;;
+    esac
+    [ "$actual" = "$expected" ] || err "checksum mismatch for $file"
+}
+
+extract_src() {
+    local archive="$1"; local dest="$2"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    tar -xf "$archive" -C "$dest" --strip-components=1
+}
+
+build_bconf() {
+    local pkg="$1"; local bconf="$2"
+    local srcdir pkgdir startdir url sum archive
+    if is_base "$pkg"; then
+        printf 'azure: %s is provided by the base system; skipping build\n' "$pkg"
+        return 0
+    fi
+    mkdir -p "$AZURE_DB/hashes"
+    current_hash=$(sha256sum "$bconf" | awk '{print $1}')
+    if grep -Fxq "$pkg" "$AZURE_DB/installed" 2>/dev/null; then
+        if [ -f "$AZURE_DB/hashes/$pkg" ] && [ "$(cat "$AZURE_DB/hashes/$pkg")" = "$current_hash" ]; then
+            printf 'azure: %s is already installed\n' "$pkg"
+            return 0
+        fi
+        printf 'azure: recipe for %s changed; reinstalling\n' "$pkg"
+    fi
+
+    # Load metadata.
+    . "$bconf"
+    local sources="$source"
+    local checksums="$sha256sums"
+
+    mkdir -p "$AZURE_CACHE/downloads" "$AZURE_CACHE/src" "$AZURE_CACHE/stage" "$AZURE_CACHE/build" "$AZURE_DB/manifests"
+    srcdir="$AZURE_CACHE/src/$pkg"
+    pkgdir="$AZURE_CACHE/stage/$pkg"
+    startdir="$AZURE_CACHE/build/$pkg"
+    rm -rf "$srcdir" "$pkgdir" "$startdir"
+    mkdir -p "$srcdir" "$pkgdir" "$startdir"
+
+    # Download and verify sources.
+    set -- $sources
+    for sum in $checksums; do
+        [ $# -gt 0 ] || err "source/checksum count mismatch for $pkg"
+        url="$1"; shift
+        archive="$AZURE_CACHE/downloads/${url##*/}"
+        if [ ! -f "$archive" ]; then
+            command -v wget >/dev/null 2>&1 || err "wget is required"
+            wget -O "$archive" "$url" || err "failed to download $url"
+        fi
+        local actual
+        actual=$(sha256sum "$archive" | awk '{print $1}')
+        [ "$actual" = "$sum" ] || err "checksum mismatch for $archive"
+        tar -xf "$archive" -C "$srcdir"
+    done
+
+    # Build and stage.
+    (
+        . "$bconf"
+        srcdir="$srcdir"; pkgdir="$pkgdir"; startdir="$startdir"
+        export srcdir pkgdir startdir
+        cd "$srcdir" || exit 1
+        if command -v build >/dev/null 2>&1; then
+            build || exit 1
+        fi
+        cd "$srcdir" || exit 1
+        if command -v package >/dev/null 2>&1; then
+            package || exit 1
+        fi
+    ) || err "build failed for $pkg"
+
+    (cd "$pkgdir" && find . \( -type f -o -type l \) -print) > "$AZURE_DB/manifests/$pkg.list"
+
+    (cd "$pkgdir" && cp -a ./* / 2>/dev/null || true)
+    for dot in "$pkgdir"/.[!.]* "$pkgdir"/..?*; do
+        [ -e "$dot" ] || continue
+        cp -a "$dot" /
+    done
+
+    printf '%s\n' "$current_hash" > "$AZURE_DB/hashes/$pkg"
+    printf '%s\n' "$pkg" >> "$AZURE_DB/installed"
+    printf 'azure: installed %s\n' "$pkg"
+}
+
+build_one() {
+    local pkg="$1"
+    local recipe url checksum srcdir stage archive dot
+    recipe=$(find_recipe "$pkg") || err "missing recipe: $pkg"
+    case "$recipe" in
+        *.bconf) build_bconf "$pkg" "$recipe"; return ;;
+    esac
+    if is_base "$pkg"; then
+        printf 'azure: %s is provided by the base system; skipping build\n' "$pkg"
+        return 0
+    fi
+    mkdir -p "$AZURE_DB/hashes"
+    current_hash=$(sha256sum "$recipe" | awk '{print $1}')
+    if grep -Fxq "$pkg" "$AZURE_DB/installed" 2>/dev/null; then
+        if [ -f "$AZURE_DB/hashes/$pkg" ] && [ "$(cat "$AZURE_DB/hashes/$pkg")" = "$current_hash" ]; then
+            printf 'azure: %s is already installed\n' "$pkg"
+            return 0
+        fi
+        printf 'azure: recipe for %s changed; reinstalling\n' "$pkg"
+    fi
+
+    url=$(get_field "$recipe" relurl)
+    [ -n "$url" ] || err "missing relurl for $pkg"
+    checksum=$(get_field "$recipe" checksum)
+
+    mkdir -p "$AZURE_CACHE/downloads" "$AZURE_CACHE/src" "$AZURE_CACHE/stage" "$AZURE_DB/manifests"
+    archive="$AZURE_CACHE/downloads/${url##*/}"
+    if [ ! -f "$archive" ]; then
+        command -v wget >/dev/null 2>&1 || err "wget is required"
+        wget -O "$archive" "$url" || err "failed to download $url"
+    fi
+    [ -n "$checksum" ] && verify_checksum "$archive" "$checksum"
+
+    srcdir="$AZURE_CACHE/src/$pkg"
+    stage="$AZURE_CACHE/stage/$pkg"
+    rm -rf "$srcdir" "$stage"
+    mkdir -p "$srcdir" "$stage"
+    extract_src "$archive" "$srcdir" || err "failed to extract $pkg"
+
+    (
+        cd "$srcdir"
+        if [ -f meson.build ]; then
+            command -v meson >/dev/null 2>&1 || err "meson is required for $pkg"
+            command -v ninja >/dev/null 2>&1 || err "ninja is required for $pkg"
+            meson setup build --prefix=/usr || exit 1
+            ninja -C build || exit 1
+            DESTDIR="$stage" ninja -C build install || exit 1
+        elif [ -x ./configure ]; then
+            ./configure --prefix=/usr || exit 1
+            make || exit 1
+            make install DESTDIR="$stage" || exit 1
+        elif [ -f Makefile ]; then
+            make || exit 1
+            if make -n install >/dev/null 2>&1; then
+                make install DESTDIR="$stage" PREFIX=/usr || exit 1
+            else
+                for bin in $(find . -maxdepth 1 -type f -perm -111); do
+                    install -D "$bin" "$stage/usr/bin/$(basename "$bin")" || exit 1
+                done
+            fi
+        else
+            err "unsupported build system for $pkg"
+        fi
+    )
+
+    (cd "$stage" && find . \( -type f -o -type l \) -print) > "$AZURE_DB/manifests/$pkg.list"
+
+    (cd "$stage" && cp -a ./* / 2>/dev/null || true)
+    for dot in "$stage"/.[!.]* "$stage"/..?*; do
+        [ -e "$dot" ] || continue
+        cp -a "$dot" /
+    done
+
+    printf '%s\n' "$current_hash" > "$AZURE_DB/hashes/$pkg"
+    printf '%s\n' "$pkg" >> "$AZURE_DB/installed"
+    printf 'azure: installed %s\n' "$pkg"
+}
+
+resolve_order() {
+    local pkg="$1"
+    local recipe dep
+    if is_base "$pkg"; then
+        return 0
+    fi
+    if grep -Fxq "$pkg" "$VISITING" 2>/dev/null; then
+        err "dependency cycle detected at $pkg"
+    fi
+    if grep -Fxq "$pkg" "$VISITED" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$pkg" >> "$VISITING"
+    recipe=$(find_recipe "$pkg") || err "missing recipe: $pkg"
+    for dep in $(deps_of "$recipe"); do
+        resolve_order "$dep"
+    done
+    grep -Fxv "$pkg" "$VISITING" > "$VISITING.tmp" 2>/dev/null || true
+    mv -f "$VISITING.tmp" "$VISITING"
+    printf '%s\n' "$pkg" >> "$VISITED"
+    printf '%s\n' "$pkg" >> "$ORDER"
+}
+
+cmd_add() {
+    [ $# -eq 1 ] || usage
+    local target="$1"
+    local tmpdir
+    find_repo || err "no Azure repository found"
+    mkdir -p "$AZURE_DB" "$AZURE_CACHE"
+    [ -f "$AZURE_DB/installed" ] || : > "$AZURE_DB/installed"
+    tmpdir="$AZURE_CACHE/resolve.$$"
+    mkdir -p "$tmpdir"
+    VISITING="$tmpdir/visiting"
+    VISITED="$tmpdir/visited"
+    ORDER="$tmpdir/order"
+    : > "$VISITING"; : > "$VISITED"; : > "$ORDER"
+    resolve_order "$target"
+    total=$(wc -l < "$ORDER" | tr -d ' ')
+    count=0
+    while IFS= read -r pkg; do
+        [ -n "$pkg" ] || continue
+        count=$((count + 1))
+        printf '[%d/%d] installing %s\n' "$count" "$total" "$pkg"
+        build_one "$pkg"
+    done < "$ORDER"
+    rm -rf "$tmpdir"
+}
+
+cmd_del() {
+    [ $# -eq 1 ] || usage
+    local pkg="$1"
+    local recipe blockers other
+    if is_base "$pkg"; then
+        err "$pkg is provided by the base system and cannot be removed"
+    fi
+    [ -f "$AZURE_DB/installed" ] || err "package database not found"
+    grep -Fxq "$pkg" "$AZURE_DB/installed" || err "$pkg is not installed"
+
+    blockers=""
+    for other in $(cat "$AZURE_DB/installed"); do
+        [ "$other" = "$pkg" ] && continue
+        recipe=$(find_recipe "$other" 2>/dev/null || true)
+        [ -n "$recipe" ] || continue
+        if deps_of "$recipe" | grep -Fxq "$pkg"; then
+            blockers="$blockers $other"
+        fi
+    done
+    [ -z "$blockers" ] || err "cannot remove $pkg; required by:$blockers"
+
+    if [ -f "$AZURE_DB/manifests/$pkg.list" ]; then
+        total=$(wc -l < "$AZURE_DB/manifests/$pkg.list" | tr -d ' ')
+        count=0
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            count=$((count + 1))
+            path="/${f#./}"
+            printf '[%d/%d] removing %s\n' "$count" "$total" "$path"
+            rm -f "$path" 2>/dev/null || true
+        done < "$AZURE_DB/manifests/$pkg.list"
+        rm -f "$AZURE_DB/manifests/$pkg.list"
+    fi
+
+    grep -Fxv "$pkg" "$AZURE_DB/installed" > "$AZURE_DB/installed.tmp" || true
+    mv -f "$AZURE_DB/installed.tmp" "$AZURE_DB/installed"
+    printf 'azure: removed %s\n' "$pkg"
+}
+
+cmd_sync() {
+    find_repo || err "no Azure repository found"
+    printf 'azure: syncing repository (%s)\n' "$AZURE_REPO"
+    if [ -d "$AZURE_REPO/.git" ]; then
+        git -C "$AZURE_REPO" pull --ff-only || err "repository sync failed"
+    fi
+    printf 'azure: sync complete\n'
+}
+
+cmd_upgrade() {
+    local pkgs pkg
+    [ -f "$AZURE_DB/installed" ] || { printf 'azure: no installed packages\n'; return 0; }
+    pkgs=$(cat "$AZURE_DB/installed")
+    : > "$AZURE_DB/installed"
+    total=$(printf '%s\n' $pkgs | grep -c .)
+    count=0
+    for pkg in $pkgs; do
+        count=$((count + 1))
+        printf '[%d/%d] upgrading %s\n' "$count" "$total" "$pkg"
+        build_one "$pkg"
+    done
+    printf 'azure: upgrade complete\n'
+}
+
+cmd_search() {
+    [ $# -ge 1 ] || usage
+    local term="$*"
+    local f name
+    results=$(find "$AZURE_REPO" -type f \( -name '*.bbr' -o -name '*.bconf' \) -print 2>/dev/null | while IFS= read -r f; do
+        if grep -qi -- "$term" "$f" 2>/dev/null; then
+            name=$(basename "$f")
+            name=${name%.*}
+            printf '%s\n' "$name"
+        fi
+    done | sort -u)
+    if [ -z "$results" ]; then
+        printf 'azure: no package found for %s\n' "$term"
+    else
+        printf '%s\n' "$results"
+    fi
+}
+
+cmd_see() {
+    [ $# -ge 1 ] || usage
+    local arg="$1"
+    if [ -f "$AZURE_DB/manifests/$arg.list" ]; then
+        cat "$AZURE_DB/manifests/$arg.list"
+        return 0
+    fi
+    local path="$arg"
+    local norm="${path#/}"
+    local manifest pkg found
+    found=0
+    for manifest in "$AZURE_DB"/manifests/*.list; do
+        [ -f "$manifest" ] || continue
+        if grep -Fxq "./$norm" "$manifest" 2>/dev/null || grep -Fxq "$path" "$manifest" 2>/dev/null || grep -q "^\./$norm/" "$manifest" 2>/dev/null || grep -q "^$path/" "$manifest" 2>/dev/null; then
+            pkg=$(basename "$manifest" .list)
+            printf '%s owns %s\n' "$pkg" "$path"
+            found=1
+        fi
+    done
+    [ "$found" -eq 1 ] || printf 'azure: no package owns %s\n' "$path"
+}
+
+cmd_upd() {
+    cmd_sync
+    cmd_upgrade
+    printf 'azure: update complete\n'
+}
+
+# Run any command in the background when invoked as: azure <cmd> ... -s
+background=0
+filtered=
+for arg in "$@"; do
+    if [ "$arg" = "-s" ]; then
+        background=1
+    else
+        filtered="$filtered $arg"
+    fi
+done
+if [ "$background" -eq 1 ]; then
+    set -- $filtered
+fi
+
+if [ "$background" -eq 1 ] && [ $# -ge 1 ]; then
+    mkdir -p "$AZURE_DB"
+    log="$AZURE_DB/azure-$1.log"
+    ( "$0" "$@" ) >"$log" 2>&1 &
+    printf 'azure: %s started in background (PID %s); log: %s\n' "$1" "$!" "$log"
+    exit 0
+fi
+
+case "${1:-}" in
+    add|get) shift; cmd_add "$@" ;;
+    del|rem) shift; cmd_del "$@" ;;
+    sync) shift; cmd_sync "$@" ;;
+    upgrade) shift; cmd_upgrade "$@" ;;
+    upd|update) shift; cmd_upd "$@" ;;
+    search) shift; cmd_search "$@" ;;
+    see|owns) shift; cmd_see "$@" ;;
+    *) usage ;;
+esac
