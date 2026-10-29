@@ -350,7 +350,7 @@ static void build_package(const char *name) {
                 int need = (stat(archive, &as) != 0);
                 if (!need && h[0] && strcmp(h, sum) != 0) { remove(archive); need = 1; }
                 if (need) {
-                    snprintf(cmd, sizeof(cmd), "/usr/bin//usr/bin/wget -O '%s' '%s'", archive, tok);
+                    snprintf(cmd, sizeof(cmd), "/usr/bin/wget -O '%s' '%s'", archive, tok);
                     run(cmd);
                 }
                 snprintf(cmd, sizeof(cmd), "tar -xf '%s' -C '%s'", archive, srcdir);
@@ -379,7 +379,7 @@ static void build_package(const char *name) {
             trim(expected);
             if (!need && h[0] && expected[0] && strcmp(h, expected) != 0) { remove(archive); need = 1; }
             if (need) {
-                snprintf(cmd, sizeof(cmd), "/usr/bin//usr/bin/wget -O '%s' '%s'", archive, packages[idx].relurl);
+                snprintf(cmd, sizeof(cmd), "/usr/bin/wget -O '%s' '%s'", archive, packages[idx].relurl);
                 run(cmd);
             }
             if (packages[idx].checksum[0]) {
