@@ -348,7 +348,10 @@ static void build_package(const char *name) {
                 struct stat as;
                 char *h = sha256_file(archive);
                 int need = (stat(archive, &as) != 0);
-                if (!need && h[0] && strcmp(h, sum) != 0) { remove(archive); need = 1; }
+                char sumscopy[MAXLINE];
+                strcpy(sumscopy, packages[idx].sha256sums);
+                char *sumtok = strtok(sumscopy, " ");
+                if (!need && h[0] && sumtok && strcmp(h, sumtok) != 0) { remove(archive); need = 1; }
                 if (need) {
                     snprintf(cmd, sizeof(cmd), "/usr/bin/wget -O '%s' '%s'", archive, tok);
                     run(cmd);
