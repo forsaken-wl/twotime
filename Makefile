@@ -1,12 +1,13 @@
 CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra
-LDFLAGS ?=
+CFLAGS ?= -O2 -Wall
 
 azure: src/azure.c
-	$(CC) $(CFLAGS) -o azure src/azure.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o azure src/azure.c
+
+inst: inst.c
+	$(CC) $(CFLAGS) -o inst inst.c
+
+all: azure inst
 
 clean:
-	rm -f azure
-
-install: azure
-	install -D -m 0755 azure /usr/bin/azure
+	rm -f azure inst
