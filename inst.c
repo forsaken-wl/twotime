@@ -16,9 +16,15 @@ static int exists(const char *path) {
 }
 
 int main(void) {
+    const char *env_disk = getenv("INST_DISK");
+    const char *env_boot = getenv("INST_BOOTLOADER");
+    const char *env_confirm = getenv("INST_CONFIRM");
     char diskname[64] = "";
+    if (env_disk) strncpy(diskname, env_disk, sizeof(diskname)-1);
     char bootloader[32] = "";
+    if (env_boot) strncpy(bootloader, env_boot, sizeof(bootloader)-1);
     char confirm[16] = "";
+    if (env_confirm) strncpy(confirm, env_confirm, sizeof(confirm)-1);
     char disk[128];
     char bootpart[160], rootpart[160];
     char mnt[] = "/mnt/rinix-target";
@@ -28,9 +34,11 @@ int main(void) {
     printf("Available disks:\n");
     system("for d in /sys/block/*; do n=${d##*/}; case \"$n\" in loop*|ram*|sr*) continue;; esac; printf '  %s\\n' \"$n\"; done");
 
-    printf("Select target disk (e.g. sda, vda): ");
-    if (!fgets(diskname, sizeof(diskname), stdin)) return 1;
-    diskname[strcspn(diskname, "\n")] = '\0';
+    if (diskname[0] == '\0') {
+        printf("Select target disk (e.g. sda, vda): ");
+        if (!fgets(diskname, sizeof(diskname), stdin)) return 1;
+        diskname[strcspn(diskname, "\n")] = '\0';
+    }
     if (diskname[0] == '\0') { fprintf(stderr, "inst: empty disk selection\n"); return 1; }
     snprintf(disk, sizeof(disk), "/dev/%s", diskname);
     struct stat st;
@@ -40,17 +48,21 @@ int main(void) {
     }
 
     printf("WARNING: all data on %s will be destroyed.\n", disk);
-    printf("Type YES to continue: ");
-    if (!fgets(confirm, sizeof(confirm), stdin)) return 1;
-    confirm[strcspn(confirm, "\n")] = '\0';
+    if (confirm[0] == '\0') {
+        printf("Type YES to continue: ");
+        if (!fgets(confirm, sizeof(confirm), stdin)) return 1;
+        confirm[strcspn(confirm, "\n")] = '\0';
+    }
     if (strcmp(confirm, "YES") != 0) {
         fprintf(stderr, "inst: aborted\n");
         return 1;
     }
 
-    printf("Bootloader (grub or syslinux): ");
-    if (!fgets(bootloader, sizeof(bootloader), stdin)) return 1;
-    bootloader[strcspn(bootloader, "\n")] = '\0';
+    if (bootloader[0] == '\0') {
+        printf("Bootloader (grub or syslinux): ");
+        if (!fgets(bootloader, sizeof(bootloader), stdin)) return 1;
+        bootloader[strcspn(bootloader, "\n")] = '\0';
+    }
     if (strcmp(bootloader, "grub") != 0 && strcmp(bootloader, "syslinux") != 0) {
         fprintf(stderr, "inst: unsupported bootloader: %s\n", bootloader);
         return 1;
