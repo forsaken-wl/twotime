@@ -346,8 +346,11 @@ static void build_package(const char *name) {
                 char archive[MAXPATH];
                 snprintf(archive, sizeof(archive), "%s/downloads/%s", cache_path, strrchr(tok, '/') ? strrchr(tok, '/') + 1 : tok);
                 struct stat as;
-                if (stat(archive, &as) != 0) {
-                    snprintf(cmd, sizeof(cmd), "wget -O '%s' '%s'", archive, tok);
+                char *h = sha256_file(archive);
+                int need = (stat(archive, &as) != 0);
+                if (!need && h[0] && strcmp(h, sum) != 0) { remove(archive); need = 1; }
+                if (need) {
+                    snprintf(cmd, sizeof(cmd), "/usr/bin//usr/bin/wget -O '%s' '%s'", archive, tok);
                     run(cmd);
                 }
                 snprintf(cmd, sizeof(cmd), "tar -xf '%s' -C '%s'", archive, srcdir);
@@ -367,8 +370,16 @@ static void build_package(const char *name) {
             char archive[MAXPATH];
             snprintf(archive, sizeof(archive), "%s/downloads/%s", cache_path, strrchr(packages[idx].relurl, '/') ? strrchr(packages[idx].relurl, '/') + 1 : packages[idx].relurl);
             struct stat as;
-            if (stat(archive, &as) != 0) {
-                snprintf(cmd, sizeof(cmd), "wget -O '%s' '%s'", archive, packages[idx].relurl);
+            char *h = sha256_file(archive);
+            int need = (stat(archive, &as) != 0);
+            char expected[256];
+            strcpy(expected, packages[idx].checksum);
+            char *colon = strchr(expected, ':');
+            if (colon) memmove(expected, colon+1, strlen(colon+1)+1);
+            trim(expected);
+            if (!need && h[0] && expected[0] && strcmp(h, expected) != 0) { remove(archive); need = 1; }
+            if (need) {
+                snprintf(cmd, sizeof(cmd), "/usr/bin//usr/bin/wget -O '%s' '%s'", archive, packages[idx].relurl);
                 run(cmd);
             }
             if (packages[idx].checksum[0]) {
